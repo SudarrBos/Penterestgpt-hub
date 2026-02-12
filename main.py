@@ -41,12 +41,18 @@ WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{PUBLIC_URL}{WEBHOOK_PATH}"
 
 # -----------------------------
-# AI + BOT
+# BOT + AI
 # -----------------------------
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher()
 
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
+
+# -----------------------------
+# SIMPLE RUN LOCK (avoid duplicate /analyze)
+# -----------------------------
+RUNNING_TARGETS: set[int] = set()
+RUNNING_LOCK = asyncio.Lock()
 
 
 # -----------------------------
@@ -57,7 +63,7 @@ async def init_db():
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS projects(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY Referentially AUTOINCREMENT,
                 owner_chat_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -120,7 +126,6 @@ async def db_get_or_create_default_project(chat_id: int) -> int:
 async def db_get_or_create_target(project_id: int, scope_text: str) -> int:
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        # create new target each time scope is set (audit trail)
         await db.execute(
             "INSERT INTO targets(project_id, scope_text, created_at) VALUES(?,?,?)",
             (project_id, scope_text, now),
@@ -148,7 +153,14 @@ async def db_get_last_target(chat_id: int) -> int | None:
         return row[0] if row else None
 
 
-async def db_save_artifact(target_id: int, kind: str, filename: str, file_id: str, blob_bytes: bytes, parsed_json: dict | None):
+async def db_save_artifact(
+    target_id: int,
+    kind: str,
+    filename: str,
+    file_id: str,
+    blob_bytes: bytes,
+    parsed_json: dict | None,
+):
     sha = hashlib.sha256(blob_bytes).hexdigest()
     now = datetime.utcnow().isoformat()
     parsed = json.dumps(parsed_json, ensure_ascii=False) if parsed_json else None
@@ -165,7 +177,6 @@ async def db_save_artifact(target_id: int, kind: str, filename: str, file_id: st
 
 
 async def db_collect_facts(target_id: int) -> dict:
-    """Collect parsed artifacts for AI."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT kind, filename, parsed_json FROM artifacts WHERE target_id=? ORDER BY id ASC",
@@ -199,14 +210,10 @@ async def db_save_ai_run(target_id: int, model: str, output_md: str):
 # PARSERS
 # -----------------------------
 def parse_nmap_xml(xml_bytes: bytes) -> dict:
-    """
-    Parse Nmap XML to a compact JSON facts pack.
-    """
     root = etree.fromstring(xml_bytes)
     hosts = []
+
     for h in root.findall("host"):
-        status = h.findtext("status/@state")
-        # safer: read status element
         st_el = h.find("status")
         state = st_el.get("state") if st_el is not None else "unknown"
 
@@ -231,15 +238,17 @@ def parse_nmap_xml(xml_bytes: bytes) -> dict:
                 version = svc.get("version") if svc is not None else None
                 extrainfo = svc.get("extrainfo") if svc is not None else None
 
-                host_obj["ports"].append({
-                    "protocol": proto,
-                    "port": int(portid) if portid and portid.isdigit() else portid,
-                    "state": pstate,
-                    "service": svc_name,
-                    "product": product,
-                    "version": version,
-                    "extra": extrainfo
-                })
+                host_obj["ports"].append(
+                    {
+                        "protocol": proto,
+                        "port": int(portid) if portid and portid.isdigit() else portid,
+                        "state": pstate,
+                        "service": svc_name,
+                        "product": product,
+                        "version": version,
+                        "extra": extrainfo,
+                    }
+                )
 
         hosts.append(host_obj)
 
@@ -247,13 +256,12 @@ def parse_nmap_xml(xml_bytes: bytes) -> dict:
 
 
 # -----------------------------
-# AI ANALYSIS (defensive, report-style)
+# AI ANALYSIS (defensive report mode)
 # -----------------------------
-def ai_analyze_facts(facts: dict) -> str:
+def ai_analyze_facts(facts: dict):
     if client is None:
-        return "⚠️ OPENAI_API_KEY не заданий. AI аналіз недоступний."
+        return "⚠️ OPENAI_API_KEY не заданий. AI аналіз недоступний.", "none"
 
-    # Defensive scope: risks + remediation + next steps without exploit walkthroughs
     system = (
         "You are a cybersecurity assessment assistant producing professional defensive reports. "
         "Use the provided scan facts to identify exposure, likely risks, and prioritized remediation. "
@@ -263,14 +271,13 @@ def ai_analyze_facts(facts: dict) -> str:
     )
 
     model = "gpt-4o-mini"
-
     resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": f"Facts JSON:\n{json.dumps(facts, ensure_ascii=False)}"}
+            {"role": "user", "content": f"Facts JSON:\n{json.dumps(facts, ensure_ascii=False)}"},
         ],
-        temperature=0.3
+        temperature=0.3,
     )
     return resp.choices[0].message.content, model
 
@@ -283,7 +290,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "🦾 *PENTESTGPT HUB*\n"
         "• `/scope <text>` — задай scope (домен/URL/опис)\n"
-        "• Надішли `nmap.xml` або інші артефакти файлом\n"
+        "• Надішли nmap.xml (або просто XML із `<nmaprun>` — навіть якщо .txt)\n"
         "• `/analyze` — AI зробить звіт\n"
     )
 
@@ -299,7 +306,7 @@ async def cmd_scope(message: types.Message):
     scope_text = parts[1].strip()
     pid = await db_get_or_create_default_project(chat_id)
     tid = await db_get_or_create_target(pid, scope_text)
-    await message.answer(f"✅ Scope зафіксовано. Target ID: `{tid}`\nТепер надішли артефакти (наприклад `nmap.xml`).")
+    await message.answer(f"✅ Scope зафіксовано. Target ID: `{tid}`\nТепер надішли артефакти (наприклад nmap.xml).")
 
 
 @dp.message(Command("analyze"))
@@ -310,20 +317,30 @@ async def cmd_analyze(message: types.Message):
         await message.answer("Спочатку задай scope: `/scope ...`")
         return
 
-    facts = await db_collect_facts(tid)
-    await message.answer("🧠 Аналізую артефакти та готую звіт…")
+    # Prevent duplicate analysis for same target
+    async with RUNNING_LOCK:
+        if tid in RUNNING_TARGETS:
+            await message.answer("⏳ Аналіз уже йде. Я допишу звіт і повернусь.")
+            return
+        RUNNING_TARGETS.add(tid)
 
-    output_md, model = await asyncio.to_thread(ai_analyze_facts, facts)
-    await db_save_ai_run(tid, model, output_md)
+    try:
+        facts = await db_collect_facts(tid)
+        await message.answer("🧠 Аналізую артефакти та готую звіт…")
 
-    # Telegram has msg limits; chunk if needed
-    if len(output_md) <= 3500:
-        await message.answer(output_md)
-    else:
-        # send as file
-        data = output_md.encode("utf-8")
-        doc = types.BufferedInputFile(data, filename=f"report_target_{tid}.md")
-        await message.answer_document(doc)
+        output_md, model = await asyncio.to_thread(ai_analyze_facts, facts)
+        await db_save_ai_run(tid, model, output_md)
+
+        if len(output_md) <= 3500:
+            await message.answer(output_md)
+        else:
+            data = output_md.encode("utf-8")
+            doc = types.BufferedInputFile(data, filename=f"report_target_{tid}.md")
+            await message.answer_document(doc)
+
+    finally:
+        async with RUNNING_LOCK:
+            RUNNING_TARGETS.discard(tid)
 
 
 # -----------------------------
@@ -351,9 +368,8 @@ async def handle_docs(message: types.Message):
     kind = "unknown"
     parsed = None
 
-    # Detect nmap xml by name / sniff
-    lower = filename.lower()
-    if lower.endswith(".xml") and b"<nmaprun" in blob[:5000]:
+    # Parse nmap by CONTENT (works even if filename ends with .txt)
+    if b"<nmaprun" in blob[:8000]:
         kind = "nmap_xml"
         try:
             parsed = parse_nmap_xml(blob)
@@ -391,7 +407,10 @@ async def healthcheck(request):
 async def telegram_webhook(request):
     data = await request.json()
     update = types.Update(**data)
-    await dp.feed_update(bot, update)
+
+    # ACK FAST: respond 200 immediately; process update in background.
+    asyncio.create_task(dp.feed_update(bot, update))
+
     return web.Response(text="ok")
 
 
