@@ -49,10 +49,14 @@ dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # -----------------------------
-# SIMPLE RUN LOCK (avoid duplicate /analyze)
+# RUN LOCKS (avoid duplicate processing)
 # -----------------------------
 RUNNING_TARGETS: set[int] = set()
 RUNNING_LOCK = asyncio.Lock()
+
+PROCESSED_UPDATES: dict[str, float] = {}  # update_id -> timestamp
+PROCESSED_LOCK = asyncio.Lock()
+PROCESSED_TTL_SEC = 120.0  # drop duplicates for 2 minutes
 
 
 # -----------------------------
@@ -63,7 +67,7 @@ async def init_db():
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS projects(
-                id INTEGER PRIMARY Referentially AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_chat_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -119,8 +123,7 @@ async def db_get_or_create_default_project(chat_id: int) -> int:
         )
         await db.commit()
         cur2 = await db.execute("SELECT last_insert_rowid()")
-        pid = (await cur2.fetchone())[0]
-        return pid
+        return (await cur2.fetchone())[0]
 
 
 async def db_get_or_create_target(project_id: int, scope_text: str) -> int:
@@ -132,8 +135,7 @@ async def db_get_or_create_target(project_id: int, scope_text: str) -> int:
         )
         await db.commit()
         cur = await db.execute("SELECT last_insert_rowid()")
-        tid = (await cur.fetchone())[0]
-        return tid
+        return (await cur.fetchone())[0]
 
 
 async def db_get_last_target(chat_id: int) -> int | None:
@@ -153,14 +155,7 @@ async def db_get_last_target(chat_id: int) -> int | None:
         return row[0] if row else None
 
 
-async def db_save_artifact(
-    target_id: int,
-    kind: str,
-    filename: str,
-    file_id: str,
-    blob_bytes: bytes,
-    parsed_json: dict | None,
-):
+async def db_save_artifact(target_id: int, kind: str, filename: str, file_id: str, blob_bytes: bytes, parsed_json: dict | None):
     sha = hashlib.sha256(blob_bytes).hexdigest()
     now = datetime.utcnow().isoformat()
     parsed = json.dumps(parsed_json, ensure_ascii=False) if parsed_json else None
@@ -255,6 +250,28 @@ def parse_nmap_xml(xml_bytes: bytes) -> dict:
     return {"tool": "nmap", "hosts": hosts}
 
 
+def compact_facts_for_ai(facts: dict, max_hosts: int = 20, max_ports_per_host: int = 50) -> dict:
+    """
+    Prevent huge payloads to the model.
+    Keeps first N hosts and first M ports per host.
+    """
+    out = {"target_id": facts.get("target_id"), "artifacts": []}
+    for art in facts.get("artifacts", []):
+        if art.get("kind") == "nmap_xml" and isinstance(art.get("data"), dict):
+            data = art["data"]
+            hosts = data.get("hosts", [])
+            slim_hosts = []
+            for h in hosts[:max_hosts]:
+                ports = h.get("ports", [])[:max_ports_per_host]
+                slim_hosts.append({**h, "ports": ports})
+            slim = {"tool": "nmap", "hosts": slim_hosts, "note": f"trimmed to {max_hosts} hosts, {max_ports_per_host} ports/host"}
+            out["artifacts"].append({"kind": art.get("kind"), "filename": art.get("filename"), "data": slim})
+        else:
+            # keep only minimal metadata for unknown artifacts
+            out["artifacts"].append({"kind": art.get("kind"), "filename": art.get("filename")})
+    return out
+
+
 # -----------------------------
 # AI ANALYSIS (defensive report mode)
 # -----------------------------
@@ -290,7 +307,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "🦾 *PENTESTGPT HUB*\n"
         "• `/scope <text>` — задай scope (домен/URL/опис)\n"
-        "• Надішли nmap.xml (або просто XML із `<nmaprun>` — навіть якщо .txt)\n"
+        "• Надішли nmap.xml (або XML із `<nmaprun>` — навіть якщо файл .txt)\n"
         "• `/analyze` — AI зробить звіт\n"
     )
 
@@ -317,7 +334,7 @@ async def cmd_analyze(message: types.Message):
         await message.answer("Спочатку задай scope: `/scope ...`")
         return
 
-    # Prevent duplicate analysis for same target
+    # Avoid duplicate analyses
     async with RUNNING_LOCK:
         if tid in RUNNING_TARGETS:
             await message.answer("⏳ Аналіз уже йде. Я допишу звіт і повернусь.")
@@ -326,6 +343,8 @@ async def cmd_analyze(message: types.Message):
 
     try:
         facts = await db_collect_facts(tid)
+        facts = compact_facts_for_ai(facts)
+
         await message.answer("🧠 Аналізую артефакти та готую звіт…")
 
         output_md, model = await asyncio.to_thread(ai_analyze_facts, facts)
@@ -338,6 +357,10 @@ async def cmd_analyze(message: types.Message):
             doc = types.BufferedInputFile(data, filename=f"report_target_{tid}.md")
             await message.answer_document(doc)
 
+    except Exception as e:
+        logger.exception("Analyze failed: %s", e)
+        await message.answer(f"⚠️ Помилка під час аналізу: {type(e).__name__}: {e}")
+
     finally:
         async with RUNNING_LOCK:
             RUNNING_TARGETS.discard(tid)
@@ -349,7 +372,7 @@ async def cmd_analyze(message: types.Message):
 @dp.message()
 async def handle_docs(message: types.Message):
     if not message.document:
-        return  # ignore plain chat for MVP
+        return
 
     chat_id = message.chat.id
     tid = await db_get_last_target(chat_id)
@@ -369,11 +392,12 @@ async def handle_docs(message: types.Message):
     parsed = None
 
     # Parse nmap by CONTENT (works even if filename ends with .txt)
-    if b"<nmaprun" in blob[:8000]:
+    if b"<nmaprun" in blob[:12000]:
         kind = "nmap_xml"
         try:
             parsed = parse_nmap_xml(blob)
         except Exception as e:
+            logger.exception("Nmap parse failed: %s", e)
             await message.answer(f"⚠️ Не зміг розпарсити nmap.xml: {type(e).__name__}: {e}")
             parsed = None
 
@@ -404,14 +428,49 @@ async def healthcheck(request):
     return web.Response(text="PENTESTGPT HUB OK")
 
 
+async def _cleanup_processed():
+    # Periodically clean old update ids
+    while True:
+        await asyncio.sleep(30)
+        now = asyncio.get_running_loop().time()
+        async with PROCESSED_LOCK:
+            dead = [k for k, ts in PROCESSED_UPDATES.items() if (now - ts) > PROCESSED_TTL_SEC]
+            for k in dead:
+                PROCESSED_UPDATES.pop(k, None)
+
+
 async def telegram_webhook(request):
-    data = await request.json()
-    update = types.Update(**data)
+    """
+    FAST ACK webhook: return 200 immediately, process update in background.
+    Also drops duplicate updates (Telegram retry storms).
+    """
+    try:
+        data = await request.json()
 
-    # ACK FAST: respond 200 immediately; process update in background.
-    asyncio.create_task(dp.feed_update(bot, update))
+        # Deduplicate by update_id if present
+        update_id = data.get("update_id")
+        now = asyncio.get_running_loop().time()
+        if update_id is not None:
+            async with PROCESSED_LOCK:
+                ts = PROCESSED_UPDATES.get(str(update_id))
+                if ts is not None and (now - ts) < PROCESSED_TTL_SEC:
+                    return web.Response(status=200, text="OK")
+                PROCESSED_UPDATES[str(update_id)] = now
 
-    return web.Response(text="ok")
+        update = types.Update(**data)
+
+        async def runner():
+            try:
+                await dp.feed_update(bot, update)
+            except Exception as e:
+                logger.exception("Update processing failed: %s", e)
+
+        asyncio.create_task(runner())
+
+    except Exception as e:
+        logger.exception("Webhook error: %s", e)
+
+    return web.Response(status=200, text="OK")
 
 
 def make_app() -> web.Application:
@@ -421,6 +480,19 @@ def make_app() -> web.Application:
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
+
+    # start cleanup task
+    async def start_bg(app_: web.Application):
+        app_["cleanup_task"] = asyncio.create_task(_cleanup_processed())
+
+    async def stop_bg(app_: web.Application):
+        t = app_.get("cleanup_task")
+        if t:
+            t.cancel()
+
+    app.on_startup.append(start_bg)
+    app.on_shutdown.append(stop_bg)
+
     return app
 
 
